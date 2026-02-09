@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Minimal process-list TUI using curses. No external dependencies."""
+
+import curses
+import os
+import subprocess
+import time
+
+# Thresholds for filtering noise in NON-TMUX / OTHER
+MIN_CPU = 0.1
+MIN_RSS_KB = 1024  # 1MB
+
+
+def read_proc_stat_fields(pid):
+    """Read /proc/PID/stat, returning (comm, ppid, utime, stime) or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            raw = f.read()
+        i = raw.rfind(")")
+        comm = raw[raw.index("(") + 1 : i]
+        fields = raw[i + 2 :].split()
+        return comm, int(fields[1]), int(fields[11]), int(fields[12])
+    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError,
+            PermissionError, OSError):
+        return None
+
+
+def read_rss_kb(pid):
+    """Return RSS in kilobytes from /proc/PID/statm, or 0."""
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * (os.sysconf("SC_PAGE_SIZE") // 1024)
+    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError,
+            PermissionError, OSError):
+        return 0
+
+
+def fmt_mem(kb):
+    if kb >= 1048576:
+        return f"{kb / 1048576:.1f}G"
+    return f"{kb / 1024:.1f}M"
+
+
+USER_LABELS = {"derp": "derp", "spin": "spin"}
+TMUX_USERS = list(USER_LABELS.keys())
+
+
+def get_tmux_map():
+    """Return {pane_pid: (user_label, session_name)} across all users via sudo."""
+    result = {}
+    for user in TMUX_USERS:
+        label = USER_LABELS[user]
+        try:
+            out = subprocess.check_output(
+                ["sudo", "-u", user, "tmux", "list-panes", "-a",
+                 "-F", "#{session_name}:#{pane_pid}"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=3,
+            )
+            for line in out.strip().splitlines():
+                name, _, pidstr = line.rpartition(":")
+                if name and pidstr.isdigit():
+                    result[int(pidstr)] = (label, name)
+        except (FileNotFoundError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired):
+            continue
+    return result
+
+
+def build_ppid_map():
+    ppid_map = {}
+    try:
+        pids = [int(e) for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return ppid_map
+    for pid in pids:
+        info = read_proc_stat_fields(pid)
+        if info:
+            ppid_map[pid] = info[1]
+    return ppid_map
+
+
+def find_tmux_session(pid, ppid_map, tmux_map):
+    visited = set()
+    cur = pid
+    while cur and cur not in visited:
+        if cur in tmux_map:
+            return tmux_map[cur]
+        visited.add(cur)
+        cur = ppid_map.get(cur)
+    return ("", "")
+
+
+def is_claude(comm):
+    return comm == "claude"
+
+
+# Build UID->name cache once per refresh
+def build_uid_map():
+    """Return {uid: username} from /etc/passwd."""
+    result = {}
+    try:
+        with open("/etc/passwd") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) >= 3:
+                    result[int(parts[2])] = parts[0]
+    except OSError:
+        pass
+    return result
+
+
+def read_proc_owner(pid, uid_map):
+    """Return username for a process from /proc/PID/status."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    uid = int(line.split()[1])
+                    return uid_map.get(uid, str(uid))
+    except (FileNotFoundError, ProcessLookupError, PermissionError,
+            OSError, ValueError, IndexError):
+        pass
+    return ""
+
+
+def collect_processes(prev_cpu):
+    clk = os.sysconf("SC_CLK_TCK")
+    now = time.monotonic()
+
+    tmux_map = get_tmux_map()
+    ppid_map = build_ppid_map()
+    uid_map = build_uid_map()
+
+    new_cpu = {}
+    tmux_claude = []
+    tmux_other = []
+    free_claude = []
+    free_other = []
+
+    for pid in list(ppid_map):
+        info = read_proc_stat_fields(pid)
+        if not info:
+            continue
+        comm, _ppid, utime, stime = info
+        total = utime + stime
+        new_cpu[pid] = (total, now)
+
+        cpu_pct = 0.0
+        if pid in prev_cpu:
+            prev_total, prev_time = prev_cpu[pid]
+            dt = now - prev_time
+            if dt > 0:
+                cpu_pct = ((total - prev_total) / clk) / dt * 100.0
+
+        rss = read_rss_kb(pid)
+        tmux_user, session = find_tmux_session(pid, ppid_map, tmux_map)
+        user = tmux_user if tmux_user else read_proc_owner(pid, uid_map)
+        row = (pid, comm, cpu_pct, rss, user, session)
+
+        if session:
+            (tmux_claude if is_claude(comm) else tmux_other).append(row)
+        else:
+            (free_claude if is_claude(comm) else free_other).append(row)
+
+    for lst in (tmux_claude, tmux_other, free_claude, free_other):
+        lst.sort(key=lambda r: r[2], reverse=True)
+
+    # Filter noise from NON-TMUX / OTHER, track hidden count
+    filtered_other = [r for r in free_other if r[2] >= MIN_CPU or r[3] >= MIN_RSS_KB]
+    hidden = len(free_other) - len(filtered_other)
+
+    sections = [
+        ("TMUX / CLAUDE", tmux_claude, 0),
+        ("TMUX / OTHER", tmux_other, 0),
+        ("NON-TMUX / CLAUDE", free_claude, 0),
+        ("NON-TMUX / OTHER", filtered_other, hidden),
+    ]
+    return sections, new_cpu
+
+
+def section_totals(rows):
+    """Return (total_cpu, total_rss_kb, count)."""
+    cpu = sum(r[2] for r in rows)
+    rss = sum(r[3] for r in rows)
+    return cpu, rss, len(rows)
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    # 1: section headers (cyan)
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    # 2: claude rows (green)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    # 3: high cpu (red) - >50%
+    curses.init_pair(3, curses.COLOR_RED, -1)
+    # 4: medium cpu (yellow) - >10%
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+    # 5: totals header (magenta)
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    # 6: dim (for hidden count)
+    curses.init_pair(6, curses.COLOR_WHITE, -1)
+
+
+def cpu_color(cpu_pct):
+    if cpu_pct >= 50.0:
+        return curses.color_pair(3) | curses.A_BOLD
+    if cpu_pct >= 10.0:
+        return curses.color_pair(4)
+    return 0
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    init_colors()
+    stdscr.timeout(1500)
+
+    prev_cpu = {}
+
+    while True:
+        sections, prev_cpu = collect_processes(prev_cpu)
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        if height < 2 or width < 20:
+            stdscr.addnstr(0, 0, "terminal too small", width)
+            stdscr.refresh()
+            stdscr.getch()
+            continue
+
+        # Column layout: PID(7) CMD(flex) CPU%(7) RSS(8) USER(6) SESSION(rest)
+        user_w = 6
+        sess_w = 24
+        fixed = 7 + 1 + 7 + 1 + 8 + 1 + user_w + 1 + sess_w
+        cmd_w = max(8, width - fixed - 1)
+
+        # === TOTALS HEADER ===
+        ncpu = os.cpu_count() or 1
+        y = 0
+        grand_cpu, grand_rss = 0.0, 0
+        sec_summaries = []
+        for sec_name, rows, _hidden in sections:
+            cpu, rss, cnt = section_totals(rows)
+            grand_cpu += cpu
+            grand_rss += rss
+            sec_summaries.append((sec_name, cpu, rss, cnt))
+
+        bar_w = 20
+        cpu_max = ncpu * 100
+        cpu_frac = min(grand_cpu / cpu_max, 1.0)
+        cpu_filled = int(cpu_frac * bar_w * 8)
+        cpu_full = cpu_filled // 8
+        cpu_part = cpu_filled % 8
+        blocks = "\u2588" * cpu_full
+        if cpu_part and cpu_full < bar_w:
+            blocks += chr(0x2590 - cpu_part)
+        cpu_bar = blocks.ljust(bar_w)
+
+        total_mem_kb = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // 1024
+        # Use /proc/meminfo for actual used memory (no shared page double-counting)
+        used_mem_kb = total_mem_kb
+        try:
+            with open("/proc/meminfo") as f:
+                mi = {}
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        mi[parts[0].rstrip(":")] = int(parts[1])
+                avail = mi.get("MemAvailable", mi.get("MemFree", 0))
+                used_mem_kb = total_mem_kb - avail
+        except (OSError, ValueError):
+            pass
+        mem_frac = min(used_mem_kb / total_mem_kb, 1.0) if total_mem_kb else 0
+        mem_filled = int(mem_frac * bar_w * 8)
+        mem_full = mem_filled // 8
+        mem_part = mem_filled % 8
+        mblocks = "\u2588" * mem_full
+        if mem_part and mem_full < bar_w:
+            mblocks += chr(0x2590 - mem_part)
+        mem_bar = mblocks.ljust(bar_w)
+
+        title = f" proctui | {ncpu} cores | {fmt_mem(total_mem_kb)} RAM"
+        try:
+            stdscr.addnstr(y, 0, title.ljust(width), width,
+                           curses.A_REVERSE | curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 1
+
+        cpu_line = f"  CPU [{cpu_bar}] {grand_cpu:6.1f}% / {cpu_max}%"
+        mem_line = f"  MEM [{mem_bar}] {fmt_mem(used_mem_kb)} / {fmt_mem(total_mem_kb)}"
+        for ln in (cpu_line, mem_line):
+            if y >= height:
+                break
+            try:
+                stdscr.addnstr(y, 0, ln, width,
+                               curses.color_pair(5) | curses.A_BOLD)
+            except curses.error:
+                pass
+            y += 1
+
+        # compact per-section summary on two lines
+        s = sec_summaries
+        line1 = (f"  tmux/claude: {s[0][3]:>3} procs {s[0][1]:6.1f}% {fmt_mem(s[0][2]):>7}"
+                 f"   tmux/other: {s[1][3]:>3} procs {s[1][1]:6.1f}% {fmt_mem(s[1][2]):>7}")
+        line2 = (f"  free/claude: {s[2][3]:>3} procs {s[2][1]:6.1f}% {fmt_mem(s[2][2]):>7}"
+                 f"   free/other: {s[3][3]:>3} procs {s[3][1]:6.1f}% {fmt_mem(s[3][2]):>7}")
+        for ln in (line1, line2):
+            if y >= height:
+                break
+            try:
+                stdscr.addnstr(y, 0, ln, width, curses.color_pair(5))
+            except curses.error:
+                pass
+            y += 1
+
+        # color legend
+        if y < height:
+            legend_parts = [
+                ("  ", 0),
+                ("\u2588 >50% ", curses.color_pair(3) | curses.A_BOLD),
+                ("\u2588 >10% ", curses.color_pair(4)),
+                ("\u2588 claude ", curses.color_pair(2)),
+                ("\u2588 other", 0),
+            ]
+            x = 0
+            for text, attr in legend_parts:
+                if x + len(text) > width:
+                    break
+                try:
+                    stdscr.addnstr(y, x, text, width - x, attr)
+                except curses.error:
+                    pass
+                x += len(text)
+            y += 1
+
+        # blank separator
+        y += 1
+
+        # === SECTIONS ===
+        for sec_name, rows, hidden in sections:
+            if y >= height:
+                break
+            # Section header with aggregate stats
+            sec_cpu, sec_rss, sec_cnt = section_totals(rows)
+            hdr = f"--- {sec_name} ({sec_cnt}"
+            if hidden:
+                hdr += f" +{hidden} idle"
+            hdr += f") | {sec_cpu:5.1f}% CPU | {fmt_mem(sec_rss)} RSS "
+            hdr = hdr + "-" * max(0, width - len(hdr))
+            try:
+                stdscr.addnstr(y, 0, hdr, width,
+                               curses.color_pair(1) | curses.A_BOLD)
+            except curses.error:
+                pass
+            y += 1
+
+            if not rows:
+                if y < height:
+                    try:
+                        stdscr.addnstr(y, 0, "  (none)", width, curses.A_DIM)
+                    except curses.error:
+                        pass
+                    y += 1
+                continue
+
+            # Column header
+            if y < height:
+                col_hdr = (f"{'PID':>7} {'COMMAND':<{cmd_w}} "
+                           f"{'CPU%':>7} {'RSS':>8} {'USER':<{user_w}} {'SESSION'}")
+                try:
+                    stdscr.addnstr(y, 0, col_hdr.ljust(width), width, curses.A_REVERSE)
+                except curses.error:
+                    pass
+                y += 1
+
+            for pid, comm, cpu, rss, user, sess in rows:
+                if y >= height:
+                    break
+                if len(comm) > cmd_w:
+                    comm = comm[: cmd_w - 1] + "~"
+                line = (f"{pid:>7} {comm:<{cmd_w}} "
+                        f"{cpu:>6.1f}% {fmt_mem(rss):>8} {user:<{user_w}} {sess}")
+                attr = cpu_color(cpu)
+                if is_claude(comm) and not attr:
+                    attr = curses.color_pair(2)
+                try:
+                    stdscr.addnstr(y, 0, line, width, attr)
+                except curses.error:
+                    pass
+                y += 1
+
+        stdscr.refresh()
+        if stdscr.getch() in (ord("q"), ord("Q")):
+            break
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)
