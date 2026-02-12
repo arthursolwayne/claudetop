@@ -2,6 +2,7 @@
 """Minimal process-list TUI using curses. No external dependencies."""
 
 import curses
+import json
 import os
 import subprocess
 import time
@@ -9,6 +10,11 @@ import time
 # Thresholds for filtering noise in NON-TMUX / OTHER
 MIN_CPU = 0.1
 MIN_RSS_KB = 1024  # 1MB
+
+# Logging
+LOG_DIR = os.path.expanduser("~/.claudetop")
+LOG_PATH = os.path.join(LOG_DIR, "history.jsonl")
+HISTORY_TAIL_LINES = 100
 
 
 def read_proc_stat_fields(pid):
@@ -126,6 +132,81 @@ def read_proc_owner(pid, uid_map):
     return ""
 
 
+def read_proc_cwd(pid):
+    """Return cwd for a process, or empty string."""
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return ""
+
+
+def resolve_session_ids(claude_pids_cwds):
+    """Given {pid: cwd}, return {pid: session_id} by tailing history.jsonl."""
+    # Build {project: session_id} from recent history across users
+    proj_to_session = {}
+    for home in ["/home/spin", "/home/derp"]:
+        path = f"{home}/.claude/history.jsonl"
+        try:
+            out = subprocess.check_output(
+                ["tail", f"-{HISTORY_TAIL_LINES}", path],
+                text=True, stderr=subprocess.DEVNULL, timeout=2,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError,
+                subprocess.TimeoutExpired):
+            continue
+        for line in out.strip().splitlines():
+            try:
+                entry = json.loads(line)
+                proj = entry.get("project", "")
+                sid = entry.get("sessionId", "")
+                if proj and sid:
+                    proj_to_session[proj] = sid
+            except (json.JSONDecodeError, ValueError):
+                continue
+    # Match by cwd
+    result = {}
+    for pid, cwd in claude_pids_cwds.items():
+        result[pid] = proj_to_session.get(cwd, "")
+    return result
+
+
+# Persistent state across ticks
+_session_cache = {}   # {pid: session_id} - resolved once per PID lifetime
+_known_pids = set()   # claude PIDs seen last tick
+_log_fh = None
+
+
+def init_logging():
+    global _log_fh
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _log_fh = open(LOG_PATH, "a")
+
+
+def log_claude_tick(ts_iso, pid, cpu, rss_kb, user, tmux_sess, session_id, cwd):
+    if not _log_fh:
+        return
+    record = {
+        "ts": ts_iso, "pid": pid, "cpu": round(cpu, 1), "rss_kb": rss_kb,
+        "user": user, "tmux": tmux_sess, "session_id": session_id, "cwd": cwd,
+    }
+    _log_fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def log_event(ts_iso, pid, event, user="", tmux_sess="", session_id="", cwd=""):
+    if not _log_fh:
+        return
+    record = {
+        "ts": ts_iso, "event": event, "pid": pid,
+        "user": user, "tmux": tmux_sess, "session_id": session_id, "cwd": cwd,
+    }
+    _log_fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def flush_log():
+    if _log_fh:
+        _log_fh.flush()
+
+
 def collect_processes(prev_cpu):
     clk = os.sysconf("SC_CLK_TCK")
     now = time.monotonic()
@@ -167,6 +248,52 @@ def collect_processes(prev_cpu):
 
     for lst in (tmux_claude, tmux_other, free_claude, free_other):
         lst.sort(key=lambda r: r[2], reverse=True)
+
+    # === Session ID resolution and logging for claude processes ===
+    global _known_pids
+    all_claudes = tmux_claude + free_claude
+    current_claude_pids = set()
+
+    # Resolve session IDs for new claudes
+    needs_resolve = {}
+    for pid, comm, cpu, rss, user, sess in all_claudes:
+        current_claude_pids.add(pid)
+        if pid not in _session_cache:
+            cwd = read_proc_cwd(pid)
+            needs_resolve[pid] = cwd
+
+    if needs_resolve:
+        resolved = resolve_session_ids(needs_resolve)
+        _session_cache.update(resolved)
+
+    # Log ticks and events
+    ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # Appear events
+    for pid in current_claude_pids - _known_pids:
+        cwd = read_proc_cwd(pid)
+        sid = _session_cache.get(pid, "")
+        # find user/tmux from the rows
+        for p, c, cpu, rss, u, s in all_claudes:
+            if p == pid:
+                log_event(ts_iso, pid, "appear", user=u, tmux_sess=s,
+                          session_id=sid, cwd=cwd)
+                break
+
+    # Disappear events
+    for pid in _known_pids - current_claude_pids:
+        sid = _session_cache.pop(pid, "")
+        log_event(ts_iso, pid, "disappear", session_id=sid)
+
+    _known_pids = current_claude_pids
+
+    # Log each claude process tick
+    for pid, comm, cpu, rss, user, sess in all_claudes:
+        cwd = read_proc_cwd(pid)
+        sid = _session_cache.get(pid, "")
+        log_claude_tick(ts_iso, pid, cpu, rss, user, sess, sid, cwd)
+
+    flush_log()
 
     # Filter noise from NON-TMUX / OTHER, track hidden count
     filtered_other = [r for r in free_other if r[2] >= MIN_CPU or r[3] >= MIN_RSS_KB]
@@ -216,6 +343,7 @@ def cpu_color(cpu_pct):
 def main(stdscr):
     curses.curs_set(0)
     init_colors()
+    init_logging()
     stdscr.timeout(1500)
 
     prev_cpu = {}
@@ -281,7 +409,7 @@ def main(stdscr):
             mblocks += chr(0x2590 - mem_part)
         mem_bar = mblocks.ljust(bar_w)
 
-        title = f" proctui | {ncpu} cores | {fmt_mem(total_mem_kb)} RAM"
+        title = f" claudetop | {ncpu} cores | {fmt_mem(total_mem_kb)} RAM"
         try:
             stdscr.addnstr(y, 0, title.ljust(width), width,
                            curses.A_REVERSE | curses.A_BOLD)
