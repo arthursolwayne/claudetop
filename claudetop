@@ -12,7 +12,7 @@ MIN_CPU = 0.1
 MIN_RSS_KB = 1024  # 1MB
 
 # Logging
-LOG_DIR = "/shared/claudetop-repo/logs"
+LOG_DIR = "/shared/claudetop/logs"
 LOG_PATH = os.path.join(LOG_DIR, "ticks.jsonl")
 HISTORY_TAIL_LINES = 100
 
