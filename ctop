@@ -7,9 +7,11 @@ import os
 import subprocess
 import time
 
-# Thresholds for filtering noise in NON-TMUX / OTHER
+# Thresholds for filtering noise
 MIN_CPU = 0.1
-MIN_RSS_KB = 1024  # 1MB
+MIN_RSS_KB = 1024   # 1MB
+# Idle tmux shells: 0% CPU, <10MB, comm is bash/zsh/sh
+TMUX_SHELL_COMMS = {"bash", "zsh", "sh"}
 
 # Logging
 LOG_DIR = "/shared/claudetop/logs"
@@ -295,13 +297,20 @@ def collect_processes(prev_cpu):
 
     flush_log()
 
-    # Filter noise from NON-TMUX / OTHER, track hidden count
+    # Filter idle shells from TMUX / OTHER
+    def is_idle_shell(row):
+        _, comm, cpu, rss, _, _ = row
+        return comm in TMUX_SHELL_COMMS and cpu < MIN_CPU and rss < 10240
+    filtered_tmux_other = [r for r in tmux_other if not is_idle_shell(r)]
+    tmux_other_hidden = len(tmux_other) - len(filtered_tmux_other)
+
+    # Filter noise from NON-TMUX / OTHER
     filtered_other = [r for r in free_other if r[2] >= MIN_CPU or r[3] >= MIN_RSS_KB]
     hidden = len(free_other) - len(filtered_other)
 
     sections = [
         ("TMUX / CLAUDE", tmux_claude, 0),
-        ("TMUX / OTHER", tmux_other, 0),
+        ("TMUX / OTHER", filtered_tmux_other, tmux_other_hidden),
         ("NON-TMUX / CLAUDE", free_claude, 0),
         ("NON-TMUX / OTHER", filtered_other, hidden),
     ]
