@@ -50,7 +50,10 @@ def fmt_mem(kb):
     return f"{kb / 1024:.1f}M"
 
 
-USER_LABELS = {"derp": "derp", "spin": "spin"}
+USER_LABELS = {
+    "arthur": "arthur", "carmack": "carmack", "derp": "derp",
+    "sonsini": "sonsini", "spin": "spin", "tetra": "tetra", "yass": "yass",
+}
 TMUX_USERS = list(USER_LABELS.keys())
 
 
@@ -146,7 +149,7 @@ def resolve_session_ids(claude_pids_cwds):
     """Given {pid: cwd}, return {pid: session_id} by tailing history.jsonl."""
     # Build {project: session_id} from recent history across users
     proj_to_session = {}
-    for home in ["/home/spin", "/home/derp"]:
+    for home in [f"/home/{u}" for u in USER_LABELS]:
         path = f"{home}/.claude/history.jsonl"
         try:
             out = subprocess.check_output(
