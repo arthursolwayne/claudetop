@@ -19,6 +19,9 @@ LOG_PATH = os.path.join(LOG_DIR, "ticks.jsonl")
 HISTORY_TAIL_LINES = 100
 
 
+PROCSCAN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "procscan")
+
+
 def read_proc_stat_fields(pid):
     """Read /proc/PID/stat, returning (comm, ppid, utime, stime) or None."""
     try:
@@ -80,17 +83,125 @@ def get_tmux_map():
     return result
 
 
-def build_ppid_map():
-    ppid_map = {}
+_PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
+
+# --- Async full-proc scanner ---
+_procscan_proc = None    # running Popen
+_procscan_result = None  # last completed (ppid_map, proc_info)
+
+
+def _kick_procscan():
+    """Launch procscan in background if not already running."""
+    global _procscan_proc
+    if _procscan_proc is not None:
+        return  # already running
     try:
-        pids = [int(e) for e in os.listdir("/proc") if e.isdigit()]
-    except OSError:
-        return ppid_map
-    for pid in pids:
-        info = read_proc_stat_fields(pid)
-        if info:
-            ppid_map[pid] = info[1]
-    return ppid_map
+        _procscan_proc = subprocess.Popen(
+            [PROCSCAN], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _poll_procscan():
+    """Check if procscan finished. If so, parse and store results, kick next."""
+    global _procscan_proc, _procscan_result
+    if _procscan_proc is None:
+        _kick_procscan()
+        return
+    ret = _procscan_proc.poll()
+    if ret is None:
+        return  # still running
+    # Done — parse output
+    ppid_map = {}
+    proc_info = {}
+    try:
+        out = _procscan_proc.stdout.read()
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 6:
+                continue
+            pid = int(parts[0])
+            comm = parts[1]
+            ppid = int(parts[2])
+            utime = int(parts[3])
+            stime = int(parts[4])
+            rss_pages = int(parts[5])
+            ppid_map[pid] = ppid
+            proc_info[pid] = (comm, ppid, utime, stime, rss_pages * _PAGE_KB)
+    except (ValueError, IndexError, OSError):
+        pass
+    _procscan_proc = None
+    _procscan_result = (ppid_map, proc_info)
+    _kick_procscan()  # start next scan immediately
+
+
+def _get_children(pid):
+    """Get direct children of a PID via /proc/pid/task/pid/children."""
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return [int(x) for x in f.read().split()]
+    except (FileNotFoundError, ProcessLookupError, PermissionError,
+            OSError, ValueError):
+        return []
+
+
+def _read_stat_for_pid(pid):
+    """Read stat for a single known PID. Returns (comm, ppid, utime, stime, rss_kb) or None."""
+    try:
+        fd = os.open(f"/proc/{pid}/stat", os.O_RDONLY)
+        raw = os.read(fd, 400)
+        os.close(fd)
+        i = raw.rfind(b")")
+        comm = raw[raw.index(b"(") + 1 : i].decode()
+        fields = raw[i + 2 :].split()
+        return (comm, int(fields[1]),
+                int(fields[11]), int(fields[12]), int(fields[21]) * _PAGE_KB)
+    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError,
+            PermissionError, OSError):
+        return None
+
+
+def build_tmux_snapshot(tmux_map):
+    """Fast targeted scan: walk process tree from tmux pane PIDs only (~40 PIDs).
+    Returns (ppid_map, proc_info) for tmux subtree only."""
+    ppid_map = {}
+    proc_info = {}
+    # Walk descendants of all tmux pane pids
+    queue = list(tmux_map.keys())
+    visited = set()
+    while queue:
+        pid = queue.pop()
+        if pid in visited:
+            continue
+        visited.add(pid)
+        info = _read_stat_for_pid(pid)
+        if info is None:
+            continue
+        comm, ppid, utime, stime, rss_kb = info
+        ppid_map[pid] = ppid
+        proc_info[pid] = (comm, ppid, utime, stime, rss_kb)
+        queue.extend(_get_children(pid))
+    return ppid_map, proc_info
+
+
+def build_proc_snapshot(tmux_map):
+    """Hybrid snapshot: fast tmux tree + async full scan for non-tmux procs.
+    Returns (ppid_map, proc_info) merged."""
+    # Always do the fast tmux tree walk (~0.01s)
+    ppid_map, proc_info = build_tmux_snapshot(tmux_map)
+
+    # Merge in last completed full scan for non-tmux procs
+    _poll_procscan()
+    if _procscan_result:
+        full_ppid, full_info = _procscan_result
+        for pid, info in full_info.items():
+            if pid not in proc_info:  # tmux snapshot takes priority
+                proc_info[pid] = info
+        for pid, ppid in full_ppid.items():
+            if pid not in ppid_map:
+                ppid_map[pid] = ppid
+
+    return ppid_map, proc_info
 
 
 def find_tmux_session(pid, ppid_map, tmux_map):
@@ -217,7 +328,7 @@ def collect_processes(prev_cpu):
     now = time.monotonic()
 
     tmux_map = get_tmux_map()
-    ppid_map = build_ppid_map()
+    ppid_map, proc_info = build_proc_snapshot(tmux_map)
     uid_map = build_uid_map()
 
     new_cpu = {}
@@ -226,11 +337,7 @@ def collect_processes(prev_cpu):
     free_claude = []
     free_other = []
 
-    for pid in list(ppid_map):
-        info = read_proc_stat_fields(pid)
-        if not info:
-            continue
-        comm, _ppid, utime, stime = info
+    for pid, (comm, _ppid, utime, stime, rss) in proc_info.items():
         total = utime + stime
         new_cpu[pid] = (total, now)
 
@@ -238,10 +345,9 @@ def collect_processes(prev_cpu):
         if pid in prev_cpu:
             prev_total, prev_time = prev_cpu[pid]
             dt = now - prev_time
-            if dt > 0:
-                cpu_pct = ((total - prev_total) / clk) / dt * 100.0
+            if dt > 0.1:
+                cpu_pct = max(0.0, ((total - prev_total) / clk) / dt * 100.0)
 
-        rss = read_rss_kb(pid)
         tmux_user, session = find_tmux_session(pid, ppid_map, tmux_map)
         user = tmux_user if tmux_user else read_proc_owner(pid, uid_map)
         row = (pid, comm, cpu_pct, rss, user, session)
@@ -361,7 +467,9 @@ def main(stdscr):
     prev_cpu = {}
 
     while True:
+        t0 = time.monotonic()
         sections, prev_cpu = collect_processes(prev_cpu)
+        collect_elapsed = time.monotonic() - t0
         stdscr.erase()
         height, width = stdscr.getmaxyx()
         if height < 2 or width < 20:
@@ -533,6 +641,12 @@ def main(stdscr):
                 y += 1
 
         stdscr.refresh()
+        # Tmux tree walk is ~0.01s. Full scan runs async in background.
+        remaining = 1.5 - (time.monotonic() - t0)
+        if remaining > 0.05:
+            stdscr.timeout(int(remaining * 1000))
+        else:
+            stdscr.timeout(50)
         if stdscr.getch() in (ord("q"), ord("Q")):
             break
 
